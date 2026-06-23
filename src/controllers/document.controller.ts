@@ -1,110 +1,147 @@
 import { Request, Response } from 'express';
 import { DocumentService } from '../services/document.service';
-import { qdrantClient, ollamaClient, config } from '../config/db';
+import { qdrantClient, ollamaClient, config, pgPool } from '../config/db';
 import { PDFParse } from 'pdf-parse';
+import crypto from 'crypto';
 
 const documentService = new DocumentService();
 
 /**
  * Controller untuk menangani pengunggahan dokumen.
- * Menerima file biner (PDF/TXT) via Multer (multipart/form-data) ATAU string teks via JSON body (kemampuan fallback).
+ * Menyimpan status pemrosesan di database PostgreSQL dan melakukan chunking/embedding.
  * 
  * POST /api/documents/upload
  */
 export const uploadDocument = async (req: Request, res: Response): Promise<void> => {
+  // Generate ID dokumen berbasis UUID
+  const documentId = crypto.randomUUID();
+  const organizationId = req.orgId; // Diambil dari authMiddleware
+
+  if (!organizationId) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Identitas tenant (organization_id) tidak teridentifikasi.'
+    });
+    return;
+  }
+
+  let filename = 'raw_text_payload';
+  let content = '';
+  const collectionName = req.body.collectionName;
+  const customMetadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
+
   try {
-    let content = '';
-    let docId = req.body.documentId;
-    const collectionName = req.body.collectionName;
-    const customMetadata = req.body.metadata ? JSON.parse(req.body.metadata) : {};
-
-    // 1. Ambil ID organisasi (tenant) yang sudah divalidasi oleh authMiddleware
-    const organizationId = req.orgId;
-
-    if (!organizationId) {
-      res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Identitas tenant (organization_id) tidak teridentifikasi.'
-      });
-      return;
+    // 1. Tentukan nama file asli
+    if (req.file) {
+      filename = req.file.originalname;
+    } else if (req.body.documentName) {
+      filename = req.body.documentName;
     }
 
-    // 2. Cek apakah ada file yang diunggah via multipart/form-data (Multer)
+    console.log(`[DocumentController] Mencatat dokumen baru ke PostgreSQL: ${filename} (${documentId}) dengan status 'processing'...`);
+
+    // 2. Catat dokumen ke database relasional dengan status 'processing'
+    const insertDocQuery = `
+      INSERT INTO documents (id, organization_id, filename, total_chunks, status)
+      VALUES ($1, $2, $3, $4, $5)
+    `;
+    await pgPool.query(insertDocQuery, [documentId, organizationId, filename, 0, 'processing']);
+
+    // 3. Cek pengunggahan berkas via Multer
     if (req.file) {
       const mimeType = req.file.mimetype;
-      const originalName = req.file.originalname;
-      docId = docId || originalName; // Gunakan nama file asli jika documentId tidak dikirim
 
-      console.log(`[DocumentController] Memproses file upload: ${originalName} (${mimeType}), Ukuran: ${req.file.size} bytes.`);
-
-      if (mimeType === 'application/pdf' || originalName.toLowerCase().endsWith('.pdf')) {
-        // Ekstrak teks dari PDF buffer menggunakan PDFParse v2
+      if (mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
         let parser: PDFParse | null = null;
         try {
           parser = new PDFParse({ data: req.file.buffer });
           const parsedPdf = await parser.getText();
           content = parsedPdf.text;
-          console.log(`[DocumentController] Sukses mengekstrak ${content.length} karakter dari PDF.`);
+          console.log(`[DocumentController] Teks berhasil diekstrak dari PDF. Karakter: ${content.length}`);
         } catch (pdfError: any) {
-          console.error('[DocumentController] Error parsing PDF buffer:', pdfError);
+          // Update status ke 'failed' jika ekstraksi PDF gagal
+          await pgPool.query(`UPDATE documents SET status = 'failed' WHERE id = $1`, [documentId]);
           res.status(400).json({
             error: 'Bad Request',
-            message: 'Gagal mengekstrak teks dari file PDF. Kemungkinan file rusak.',
+            message: 'Gagal mengekstrak teks dari file PDF.',
             details: pdfError.message
           });
           return;
         } finally {
-          // Sangat penting untuk memanggil destroy() guna mencegah kebocoran memori (memory leak)
           if (parser) {
             await parser.destroy();
           }
         }
-      } else if (mimeType === 'text/plain' || originalName.toLowerCase().endsWith('.txt')) {
-        // Baca file TXT langsung dari memory buffer
+      } else if (mimeType === 'text/plain' || filename.toLowerCase().endsWith('.txt')) {
         content = req.file.buffer.toString('utf-8');
       } else {
+        await pgPool.query(`UPDATE documents SET status = 'failed' WHERE id = $1`, [documentId]);
         res.status(400).json({
           error: 'Unsupported Media Type',
-          message: 'Format file tidak didukung. Sistem hanya menerima file berekstensi .pdf dan .txt.'
+          message: 'Format file tidak didukung. Hanya menerima file .pdf dan .txt.'
         });
         return;
       }
     } else {
-      // 3. Fallback: Cek jika data dikirim sebagai JSON biasa (retro-compatibility)
+      // Fallback JSON Body
       content = req.body.content;
       if (!content) {
+        await pgPool.query(`UPDATE documents SET status = 'failed' WHERE id = $1`, [documentId]);
         res.status(400).json({
           error: 'Bad Request',
-          message: 'Permintaan tidak valid. Unggah file dokumen (.pdf/.txt) atau berikan parameter string "content" di JSON body.'
+          message: 'Parameter "content" atau upload file wajib disertakan.'
         });
         return;
       }
     }
 
-    // Ekstraksi tambahan untuk metadata dokumen
+    // 4. Jalankan Ingestion Service (chunking, embedding, Qdrant)
     const metadata = {
       ...customMetadata,
-      source_file: req.file ? req.file.originalname : 'raw_text_json',
+      source_file: filename,
       uploaded_at: new Date().toISOString()
     };
 
-    console.log(`[DocumentController] Menjalankan ingestion untuk tenant: ${organizationId}, Doc: ${docId}`);
-
-    // 4. Jalankan DocumentService untuk memotong teks, men-generate embedding, dan menyimpan ke database
-    const result = await documentService.processDocument({
-      documentId: docId,
+    const ingestionResult = await documentService.processDocument({
+      documentId: documentId,
       content,
       organizationId,
       collectionName,
       metadata
     });
 
+    // 5. Update status dokumen di PostgreSQL menjadi 'completed' dan isi total_chunks
+    const updateDocQuery = `
+      UPDATE documents
+      SET status = 'completed', total_chunks = $1
+      WHERE id = $2
+    `;
+    await pgPool.query(updateDocQuery, [ingestionResult.chunksCount, documentId]);
+
+    console.log(`[DocumentController] Dokumen ID: ${documentId} sukses diproses. Total chunks: ${ingestionResult.chunksCount}`);
+
     res.status(201).json({
       message: 'Dokumen berhasil diunggah, diekstrak, dan diindeks ke sistem.',
-      data: result
+      data: {
+        documentId: ingestionResult.documentId,
+        organizationId: ingestionResult.organizationId,
+        chunksCount: ingestionResult.chunksCount,
+        collectionName: ingestionResult.collectionName,
+        status: 'completed',
+        insertedIds: ingestionResult.insertedIds
+      }
     });
+
   } catch (error: any) {
-    console.error('[DocumentController] Gagal memproses dokumen upload:', error);
+    console.error(`[DocumentController] Error memproses upload dokumen (ID: ${documentId}):`, error);
+
+    // Update status ke 'failed' jika terjadi error sistem saat pemrosesan RAG
+    try {
+      await pgPool.query(`UPDATE documents SET status = 'failed' WHERE id = $1`, [documentId]);
+    } catch (dbUpdateError) {
+      console.error('[DocumentController] Gagal memperbarui status gagal ke DB:', dbUpdateError);
+    }
+
     res.status(500).json({
       error: 'Internal Server Error',
       message: 'Gagal mengunggah dan memproses dokumen.',
@@ -115,16 +152,14 @@ export const uploadDocument = async (req: Request, res: Response): Promise<void>
 
 /**
  * Controller untuk melakukan pencarian semantik (Vector Search).
- * Hanya menerima query dan mengambil identitas tenant dari token API Key.
+ * Menggunakan filter organization_id untuk isolasi tenant.
  * 
  * POST /api/documents/search
  */
 export const searchRelevantChunks = async (req: Request, res: Response): Promise<void> => {
   try {
     const { query, collectionName, limit } = req.body;
-    
-    // Ambil ID organisasi (tenant) yang sudah divalidasi oleh authMiddleware
-    const organizationId = req.orgId;
+    const organizationId = req.orgId; // Diambil dari authMiddleware
 
     if (!organizationId) {
       res.status(401).json({
@@ -145,7 +180,7 @@ export const searchRelevantChunks = async (req: Request, res: Response): Promise
     const targetCollection = collectionName || 'documents';
     const searchLimit = parseInt(limit || '5', 10);
 
-    console.log(`[DocumentController] Pencarian semantik oleh tenant "${organizationId}": "${query}"`);
+    console.log(`[DocumentController] Pencarian semantik oleh tenant UUID "${organizationId}": "${query}"`);
 
     // 1. Konversi query menjadi vektor
     const embedResponse = await ollamaClient.embeddings({
