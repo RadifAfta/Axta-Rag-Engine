@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import healthRouter from './routes/health';
 import documentRouter from './routes/document.routes';
+import adminRouter from './routes/admin.routes';
 import { config, pgPool } from './config/db';
 
 dotenv.config();
@@ -16,6 +17,7 @@ app.use(express.json());
 // Routes
 app.use('/api/health', healthRouter);
 app.use('/api/documents', documentRouter);
+app.use('/api/admin', adminRouter);
 
 // Global Error Handler Middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
