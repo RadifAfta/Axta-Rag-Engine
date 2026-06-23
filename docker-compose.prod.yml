@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: axta-prod-postgres
+    environment:
+      POSTGRES_USER: axta_user
+      POSTGRES_PASSWORD: axta_password
+      POSTGRES_DB: axta_rag_db
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    restart: always
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: axta-prod-qdrant
+    volumes:
+      - qdrant_prod_data:/qdrant/storage
+    restart: always
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: axta-prod-ollama
+    volumes:
+      - ollama_prod_data:/root/.ollama
+    restart: always
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: axta-prod-app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://axta_user:axta_password@postgres:5432/axta_rag_db
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      - EMBEDDING_MODEL=nomic-embed-text
+      - ADMIN_TOKEN=admin_secret_token_123
+    depends_on:
+      - postgres
+      - qdrant
+      - ollama
+    restart: always
+
+volumes:
+  postgres_prod_data:
+  qdrant_prod_data:
+  ollama_prod_data:
